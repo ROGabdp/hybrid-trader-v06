@@ -55,8 +55,6 @@ Thumbs.db
 .idea/
 
 # Large Directories
-03 MA120 體制監控 + 動態 Donchian 濾網，減少熊市時的錯誤買入/
-04 測試賣出信心門檻提高到0.6 成效在有牛熊判斷時不佳，因此回到03版/
+models_hybrid_v5
 data
-01 buy 訓練看120天max10趴  訓練去除濾網 next120max公式錯誤修正
-02 V5 模型與相關腳本 - 對稱獎勵 + 無濾網 - 目前最會買賣的版本
+01 去除LSTM，並修復sell agent不會賣的問題

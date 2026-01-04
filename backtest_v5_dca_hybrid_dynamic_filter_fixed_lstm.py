@@ -78,6 +78,8 @@ def parse_args():
     )
     parser.add_argument('--start', type=str, default=DEFAULT_START_DATE)
     parser.add_argument('--end', type=str, default=DEFAULT_END_DATE)
+    parser.add_argument('--sell-threshold', type=float, default=0.5, help='Confidence threshold for sell signals')
+    parser.add_argument('--buy-consensus-threshold', type=float, default=0.8, help='Buy confidence threshold to veto sell signals')
     return parser.parse_args()
 
 
@@ -106,12 +108,15 @@ class LeveragedSharedPoolBacktester:
     LEVERAGE_THRESHOLD = 0.08  # 下跌 8% 啟動槓桿 (與停損點一致)
     
     def __init__(self, buy_model, sell_model, yearly_capital=600_000,
-                 dca_amount=50_000, ai_chunk_amount=50_000):
+                 dca_amount=50_000, ai_chunk_amount=50_000,
+                 sell_threshold=0.5, buy_consensus_threshold=0.8):
         self.buy_model = buy_model
         self.sell_model = sell_model
         self.yearly_capital = yearly_capital
         self.dca_amount = dca_amount
         self.ai_chunk_amount = ai_chunk_amount
+        self.sell_threshold = sell_threshold
+        self.buy_consensus_threshold = buy_consensus_threshold
         
         self.trades = []
         self.equity_curve = []
@@ -297,6 +302,13 @@ class LeveragedSharedPoolBacktester:
             day_sold_count = 0
             day_bought_shares = 0
             day_ai_leverage = 1.0
+
+            # 🔥 Agent Consensus: 每日必須取得 Buy Agent 的信心度 (即使 Dynamic Filter 有開啟，這裡主要用於 Consensus)
+            current_obs = obs.reshape(1, -1)
+            buy_action_pred, _ = self.buy_model.predict(current_obs, deterministic=True)
+            buy_probs = self.buy_model.policy.get_distribution(self.buy_model.policy.obs_to_tensor(current_obs)[0]).distribution.probs.detach().cpu().numpy()[0]
+            current_buy_conf = float(buy_probs[1]) if buy_action_pred[0] == 1 else float(buy_probs[0])
+            day_buy_conf = current_buy_conf
             
             # 檢查持倉賣出 (AI positions)
             max_sell_conf_today = 0
@@ -315,11 +327,20 @@ class LeveragedSharedPoolBacktester:
                 sell_conf = float(sell_probs[1]) if action[0] == 1 else float(sell_probs[0])
                 max_sell_conf_today = max(max_sell_conf_today, sell_conf)
                 
-                log_entry = {'date': date, 'status': 'holding', 'price': price, 'sell_conf': sell_conf, 'buy_conf': 0, 'action': 'hold', 'leverage': pos['leverage']}
+                log_entry = {'date': date, 'status': 'holding', 'price': price, 'sell_conf': sell_conf, 'buy_conf': current_buy_conf, 'action': 'hold', 'leverage': pos['leverage']}
                 self.daily_confidence.append(log_entry)
                 
-                # 賣出條件：AI 決定賣出 或 槓桿後報酬 < 0.92
-                if action[0] == 1 or leveraged_return < 0.92:
+                # 賣出條件：(AI 決定賣出 且 無共識否決) 或 槓桿後報酬 < 0.92 (強制停損)
+                is_stop_loss = leveraged_return < 0.92
+                is_sell_signal = (action[0] == 1 and sell_conf > self.sell_threshold)
+                
+                # 共識檢查
+                is_consensus_hold = False
+                if is_sell_signal and not is_stop_loss:
+                    if current_buy_conf > self.buy_consensus_threshold:
+                        is_consensus_hold = True
+
+                if (is_sell_signal and not is_consensus_hold) or is_stop_loss:
                     log_entry['action'] = 'SELL'
                     # 計算實際收益 (考慮槓桿)
                     leveraged_value = pos['cost'] * leveraged_return
@@ -345,16 +366,13 @@ class LeveragedSharedPoolBacktester:
             
             # 🔥 使用動態計算的買入金額
             if yearly_pool >= dynamic_chunk_amount and dynamic_chunk_amount > price:
-                buy_obs = obs.reshape(1, -1)
-                action, _ = self.buy_model.predict(buy_obs, deterministic=True)
-                buy_probs = self.buy_model.policy.get_distribution(self.buy_model.policy.obs_to_tensor(buy_obs)[0]).distribution.probs.detach().cpu().numpy()[0]
-                buy_conf = float(buy_probs[1]) if action[0] == 1 else float(buy_probs[0])
-                day_buy_conf = buy_conf
+                # buy_conf 已經在上面計算了 (current_buy_conf)
+                # 直接使用 current_buy_conf
                 
-                log_entry = {'date': date, 'status': 'check_buy', 'price': price, 'buy_conf': buy_conf, 'action': 'wait', 'leverage': current_leverage, 'regime': current_regime, 'filter_pass': pass_dynamic_filter}
+                log_entry = {'date': date, 'status': 'check_buy', 'price': price, 'buy_conf': current_buy_conf, 'action': 'wait', 'leverage': current_leverage, 'regime': current_regime, 'filter_pass': pass_dynamic_filter}
                 self.daily_confidence.append(log_entry)
 
-                if action[0] == 1:
+                if buy_action_pred[0] == 1:
                     # AI 想買 - 檢查動態濾網
                     if pass_dynamic_filter:
                         fund = min(dynamic_chunk_amount, yearly_pool)
@@ -372,14 +390,14 @@ class LeveragedSharedPoolBacktester:
                                 'cost': cost,
                                 'leverage': current_leverage
                             })
-                            self.ai_buy_signals.append({'date': date, 'price': price, 'confidence': buy_conf, 'leverage': current_leverage})
+                            self.ai_buy_signals.append({'date': date, 'price': price, 'confidence': current_buy_conf, 'leverage': current_leverage})
                             day_action = 'BUY'
                             day_bought_shares = shares
                             day_ai_leverage = current_leverage
                     else:
                         # 被濾網擋下
                         log_entry['action'] = 'FILTERED'
-                        self.filtered_signals.append({'date': date, 'price': price, 'confidence': buy_conf, 'regime': current_regime})
+                        self.filtered_signals.append({'date': date, 'price': price, 'confidence': current_buy_conf, 'regime': current_regime})
             
             # 產生當日摘要
             dca_position_count = len(dca_positions)
@@ -495,12 +513,15 @@ class LeveragedSharedPoolBacktester:
 # =============================================================================
 class SharedPoolBacktester:
     def __init__(self, buy_model, sell_model, yearly_capital=600_000, 
-                 dca_amount=50_000, ai_chunk_amount=50_000):
+                 dca_amount=50_000, ai_chunk_amount=50_000,
+                 sell_threshold=0.5, buy_consensus_threshold=0.8):
         self.buy_model = buy_model
         self.sell_model = sell_model
         self.yearly_capital = yearly_capital
         self.dca_amount = dca_amount
         self.ai_chunk_amount = ai_chunk_amount
+        self.sell_threshold = sell_threshold
+        self.buy_consensus_threshold = buy_consensus_threshold
         
         self.trades = []
         self.equity_curve = []
@@ -636,6 +657,13 @@ class SharedPoolBacktester:
             day_sold_count = 0
             day_bought_shares = 0
             
+            # 🔥 Agent Consensus: 每日必須取得 Buy Agent 的信心度
+            current_obs = obs.reshape(1, -1)
+            buy_action_pred, _ = self.buy_model.predict(current_obs, deterministic=True)
+            buy_probs = self.buy_model.policy.get_distribution(self.buy_model.policy.obs_to_tensor(current_obs)[0]).distribution.probs.detach().cpu().numpy()[0]
+            current_buy_conf = float(buy_probs[1]) if buy_action_pred[0] == 1 else float(buy_probs[0])
+            day_buy_conf = current_buy_conf
+
             # 檢查持倉賣出
             max_sell_conf_today = 0
             for idx in range(len(ai_positions) - 1, -1, -1):
@@ -649,10 +677,19 @@ class SharedPoolBacktester:
                 sell_conf = float(sell_probs[1]) if action[0] == 1 else float(sell_probs[0])
                 max_sell_conf_today = max(max_sell_conf_today, sell_conf)
                 
-                log_entry = {'date': date, 'status': 'holding', 'price': price, 'sell_conf': sell_conf, 'buy_conf': 0, 'action': 'hold'}
+                log_entry = {'date': date, 'status': 'holding', 'price': price, 'sell_conf': sell_conf, 'buy_conf': current_buy_conf, 'action': 'hold'}
                 self.daily_confidence.append(log_entry)
                 
-                if action[0] == 1 or current_return < 0.92:
+                is_stop_loss = current_return < 0.92
+                is_sell_signal = (action[0] == 1 and sell_conf > self.sell_threshold)
+                
+                # 共識檢查
+                is_consensus_hold = False
+                if is_sell_signal and not is_stop_loss:
+                    if current_buy_conf > self.buy_consensus_threshold:
+                        is_consensus_hold = True
+
+                if (is_sell_signal and not is_consensus_hold) or is_stop_loss:
                     log_entry['action'] = 'SELL'
                     proceeds = pos['shares'] * price
                     profit = proceeds - pos['cost']
@@ -669,16 +706,12 @@ class SharedPoolBacktester:
             
             # 🔥 使用動態計算的買入金額
             if yearly_pool >= dynamic_chunk_amount and dynamic_chunk_amount > price:
-                buy_obs = obs.reshape(1, -1)
-                action, _ = self.buy_model.predict(buy_obs, deterministic=True)
-                buy_probs = self.buy_model.policy.get_distribution(self.buy_model.policy.obs_to_tensor(buy_obs)[0]).distribution.probs.detach().cpu().numpy()[0]
-                buy_conf = float(buy_probs[1]) if action[0] == 1 else float(buy_probs[0])
-                day_buy_conf = buy_conf
+                # current_buy_conf 已經在上面計算了
                 
-                log_entry = {'date': date, 'status': 'check_buy', 'price': price, 'buy_conf': buy_conf, 'action': 'wait', 'regime': current_regime, 'filter_pass': pass_dynamic_filter}
+                log_entry = {'date': date, 'status': 'check_buy', 'price': price, 'buy_conf': current_buy_conf, 'action': 'wait', 'regime': current_regime, 'filter_pass': pass_dynamic_filter}
                 self.daily_confidence.append(log_entry)
 
-                if action[0] == 1:
+                if buy_action_pred[0] == 1:
                     # AI 想買 - 檢查動態濾網
                     if pass_dynamic_filter:
                         fund = min(dynamic_chunk_amount, yearly_pool)
@@ -690,13 +723,13 @@ class SharedPoolBacktester:
                             leftover = fund - cost
                             yearly_pool += leftover  # 零頭放回池中
                             ai_positions.append({'shares': shares, 'buy_price': price, 'buy_idx': i, 'cost': cost})
-                            self.ai_buy_signals.append({'date': date, 'price': price, 'confidence': buy_conf})
+                            self.ai_buy_signals.append({'date': date, 'price': price, 'confidence': current_buy_conf})
                             day_action = 'BUY'
                             day_bought_shares = shares
                     else:
                         # 被濾網擋下
                         log_entry['action'] = 'FILTERED'
-                        self.filtered_signals.append({'date': date, 'price': price, 'confidence': buy_conf, 'regime': current_regime})
+                        self.filtered_signals.append({'date': date, 'price': price, 'confidence': current_buy_conf, 'regime': current_regime})
             
             # 產生當日摘要 - 格式: DCA買賣, AI買賣, 總倉數
             # DCA 視為每月買1倉 (50k), AI 每筆買1倉 (50k)
@@ -888,6 +921,8 @@ def main():
     print("=" * 70)
     print(f"  📅 回測開始日期: {start_date.date()}")
     print(f"  📅 回測結束日期: {end_date.date() if end_date else '最新資料'}")
+    print(f"  ⚙️ Sell Threshold: {args.sell_threshold}")
+    print(f"  ⚙️ Buy Consensus Threshold: {args.buy_consensus_threshold}")
     # [v6.0] LSTM 已移除
     
     os.makedirs(RESULTS_PATH, exist_ok=True)
@@ -908,11 +943,23 @@ def main():
     if end_date: twii_backtest_df = twii_backtest_df[twii_backtest_df.index <= end_date]
     
     print("\n[Backtest] Running Strategy 1: Shared Pool + 2x Leverage on Drawdown...")
-    bt1 = LeveragedSharedPoolBacktester(buy_model, sell_model, YEARLY_CAPITAL)
+    bt1 = LeveragedSharedPoolBacktester(
+        buy_model, 
+        sell_model, 
+        YEARLY_CAPITAL,
+        sell_threshold=args.sell_threshold,
+        buy_consensus_threshold=args.buy_consensus_threshold
+    )
     m1 = bt1.run(twii_backtest_df, hybrid.FEATURE_COLS)
 
     print("\n[Backtest] Running Strategy 2: Shared Pool...")
-    bt2 = SharedPoolBacktester(buy_model, sell_model, YEARLY_CAPITAL)
+    bt2 = SharedPoolBacktester(
+        buy_model, 
+        sell_model, 
+        YEARLY_CAPITAL,
+        sell_threshold=args.sell_threshold,
+        buy_consensus_threshold=args.buy_consensus_threshold
+    )
     m2 = bt2.run(twii_backtest_df, hybrid.FEATURE_COLS)
     
     print("\n[Benchmark] Calculating benchmarks...")

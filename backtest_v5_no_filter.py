@@ -72,6 +72,8 @@ def parse_args():
         default=DEFAULT_END_DATE,
         help='回測結束日期 (YYYY-MM-DD 格式，預設: 最新資料)'
     )
+    parser.add_argument('--sell-threshold', type=float, default=0.5, help='Confidence threshold for sell signals')
+    parser.add_argument('--buy-consensus-threshold', type=float, default=0.8, help='Buy confidence threshold to veto sell signals')
     return parser.parse_args()
 
 
@@ -82,10 +84,13 @@ class V5Backtester:
     """
     V5 回測器：無濾網限制
     """
-    def __init__(self, buy_model, sell_model, initial_capital=1_000_000):
+    def __init__(self, buy_model, sell_model, initial_capital=1_000_000, 
+                 sell_threshold=0.5, buy_consensus_threshold=0.8):
         self.buy_model = buy_model
         self.sell_model = sell_model
         self.initial_capital = initial_capital
+        self.sell_threshold = sell_threshold
+        self.buy_consensus_threshold = buy_consensus_threshold
         self.trades = []
         self.equity_curve = []
         self.buy_signals = []
@@ -134,16 +139,37 @@ class V5Backtester:
                 sell_probs = self.sell_model.policy.get_distribution(sell_obs_tensor).distribution.probs.detach().cpu().numpy()[0]
                 sell_confidence = float(sell_probs[1]) if action[0] == 1 else float(sell_probs[0])
                 
+                # 🔥 Agent Consensus Check: 取得 Buy Agent 對當前市場的信心
+                # (即使目前是持有狀態，也要問 Buy Agent 怎麼看)
+                buy_obs_check = obs.reshape(1, -1)
+                buy_action_check, _ = self.buy_model.predict(buy_obs_check, deterministic=True)
+                buy_check_tensor = self.buy_model.policy.obs_to_tensor(buy_obs_check)[0]
+                buy_check_probs = self.buy_model.policy.get_distribution(buy_check_tensor).distribution.probs.detach().cpu().numpy()[0]
+                # 取得 Buy Confidence (看漲機率)
+                current_buy_conf = float(buy_check_probs[1]) if buy_action_check[0] == 1 else float(buy_check_probs[0])
+                if buy_action_check[0] == 0: # 如果是看跌/觀望，信心要轉換嗎？不，我們需要的是「想買」的信心
+                     # StableBaselines3 的 probs 是 [prob_0, prob_1]
+                     # 如果 action 是 0 (WAIT), conf 是 prob_0. 我們需要 prob_1 (BUY機率) 來判斷多頭共識
+                     current_buy_conf = float(buy_check_probs[1]) 
+
                 self.daily_confidence.append({
                     'date': date, 'status': 'holding', 'price': price,
-                    'buy_conf': None, 'sell_conf': sell_confidence,
+                    'buy_conf': current_buy_conf, 'sell_conf': sell_confidence,
                     'sell_action': 'SELL' if action[0] == 1 else 'HOLD',
                     'current_return': current_return
                 })
                 
                 stop_loss = current_return < 0.92
-                ai_sell = action[0] == 1
-                should_sell = ai_sell or stop_loss
+                is_sell_signal = (action[0] == 1 and sell_confidence > self.sell_threshold)
+                
+                # Consensus Veto
+                is_vetoed = False
+                if is_sell_signal and not stop_loss:
+                    if current_buy_conf > self.buy_consensus_threshold:
+                        is_vetoed = True
+                        # print(f"  🛑 [{date.strftime('%Y-%m-%d')}] Sell Vetoed! SellConf:{sell_confidence:.2f} BuyProb:{current_buy_conf:.2f}")
+
+                should_sell = (is_sell_signal and not is_vetoed) or stop_loss
                 
                 if should_sell:
                     sell_value = position['shares'] * price
@@ -287,6 +313,8 @@ def main():
     print("=" * 60)
     print(f"  📅 開始日期: {args.start}")
     print(f"  📅 結束日期: {args.end if args.end else '最新資料'}")
+    print(f"  ⚙️ Sell Threshold: {args.sell_threshold}")
+    print(f"  ⚙️ Buy Consensus Threshold: {args.buy_consensus_threshold}")
     
     os.makedirs(RESULTS_PATH, exist_ok=True)
     
@@ -339,7 +367,13 @@ def main():
     # 執行回測
     # =========================================================================
     print("\n[Backtest] 開始 V5 回測...")
-    backtester = V5Backtester(buy_model, sell_model, INITIAL_CAPITAL)
+    backtester = V5Backtester(
+        buy_model, 
+        sell_model, 
+        INITIAL_CAPITAL,
+        sell_threshold=args.sell_threshold,
+        buy_consensus_threshold=args.buy_consensus_threshold
+    )
     metrics = backtester.run(twii_backtest_df, hybrid.FEATURE_COLS)
     
     # =========================================================================

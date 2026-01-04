@@ -8,6 +8,8 @@
 2. 強制 CPU 訓練 (在train_v5_models.py中)
 3. 調整sell agent的學習目標
 4. 調整訓練和驗證的超參數設定，讓評估更穩定，且最終選出的模型會更有代表性。
+5. 導入代理人共識機制
+
 
 # 針對v5模型，搭配了牛熊MA120濾網，更新了回測腳本和每日運營腳本:
 
@@ -27,6 +29,7 @@
 2. 解耦獎勵視窗 (Lookahead)：無論在哪一天結算，系統都會往後看固定 60 天來計算「錯過高點」及「躲過大跌」的獎勵/懲罰。即使被隨機踢出局，也無法免於被評價後續走勢。
 3. 資料切片擴大：每個 Episode 的資料從 120 天增加到 310 天，以容納最長 250 天的 Episode 加上 60 天的 Lookahead。
 4. 核心獎勵公式（基礎報酬、錯失高點懲罰、躲過大跌獎勵）維持不變，只修改了計算所用的時間視窗。
+5. 導入代理人共識機制
 
 # evl 時不知道為什麼，一開始分數都會飆高，導致雖然跑了 1M steps，但最後存下來的model 卻是前面沒跑幾步的模型。 
 
@@ -40,6 +43,30 @@ Fine-tune 目前是 0.005，建議改回 0.01（與 Pre-train 相同）。
 TensorBoard 顯示 entropy 下降很快（Agent 太快變自信）。提高這個係數可以強迫 Agent 保持「好奇心」，不要太早鎖死在「死抱不賣」這個局部最佳解。
 3. 降低學習率 (learning_rate)：
 目前是 1e-5，可以降為 5e-6。讓 Fine-tune 的步伐更慢、更穩，避免破壞 Pre-train 學到的知識，也能減少訓練過程的震盪。
+
+# 導入代理人共識機制 (Agent Consensus)
+
+為了解決 Sell Agent 在強勢牛市中過早賣出 (Churning) 的問題，我們引入了「買方否決權」機制。
+
+**核心邏輯：**
+在賣出決策執行前，加入 Buy Agent 的信心確認。
+*   如果 `Buy_Conf > 0.8` (Consensus Threshold)，表示 AI 極度看好後市，此時即使 Sell Agent 發出賣訊 (Confidence > 0.5)，也會被**否決 (Veto)**，強制持倉。
+*   唯一例外：硬性停損 (觸發 -8% 或 槓桿後 < 0.92) 擁有最高優先級，無視共識機制直接賣出。
+
+**驗證結果 (2023-2026 牛市)：**
+*   **交易次數**：從 17 次大幅降至 4 次，有效減少磨損。
+*   **平均持有天數**：從 17 天增加至 146 天，成功抱住主升段。
+*   **報酬率**：驗證回測顯示報酬率從 +74.4% 提升至 +88.9%。
+*   **熊市表現**：在 2022 熊市中，因 Buy Agent 信心低，不會觸發否決，Sell Agent 仍能正常發揮防守功能。
+
+**已更新檔案：**
+*   回測腳本：`backtest_v5_no_filter.py`, `backtest_v5_dca_hybrid_no_filter_fixed_lstm.py`, `backtest_v5_dca_hybrid_dynamic_filter_fixed_lstm.py`
+*   實戰腳本：`daily_ops_v5_dynamic_filter_fixed_lstm.py`, `daily_ops_v5_intraday_dynamic_filter_fixed_lstm.py`
+
+
+
+
+
 
 
 

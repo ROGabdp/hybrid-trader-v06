@@ -1,0 +1,54 @@
+Reading results_backtest_v5_no_filter/daily_confidence_v5_20230103_20260102.csv
+
+Total rows with Sell Confidence: 702
+
+--- Sell Confidence Statistics ---
+count    702.000000
+mean       0.974581
+std        0.077373
+min        0.501233
+25%        0.995755
+50%        0.999865
+75%        0.999988
+max        0.999998
+Name: sell_conf, dtype: float64
+
+--- Sell Action Counts ---
+sell_action
+HOLD    688
+SELL     14
+Name: count, dtype: int64
+
+--- Potential Threshold Analysis ---
+Sell Confidence >= 0.5: 702 rows (100.00%)
+Sell Confidence >= 0.6: 693 rows (98.72%)
+Sell Confidence >= 0.7: 682 rows (97.15%)
+Sell Confidence >= 0.8: 670 rows (95.44%)
+Sell Confidence >= 0.9: 645 rows (91.88%)
+Sell Confidence >= 0.95: 624 rows (88.89%)
+Sell Confidence >= 0.99: 567 rows (80.77%)
+
+--- Top 10 Highest Confidence Rows ---
+           date     price  ...  sell_action current_return
+540  2025-04-09  17391.76  ...         HOLD       0.942135
+535  2025-03-31  20695.90  ...         HOLD       0.922725
+379  2024-08-05  19830.88  ...         HOLD       0.867043
+542  2025-04-11  19528.77  ...         HOLD       1.057899
+250  2024-01-17  17161.79  ...         HOLD       1.014142
+401  2024-09-04  21092.75  ...         HOLD       0.940419
+195  2023-10-31  16001.27  ...         HOLD       0.945563
+307  2024-04-19  19527.12  ...         HOLD       0.940920
+575  2025-05-29  21347.30  ...         HOLD       1.156412
+67   2023-04-25  15370.73  ...         HOLD       1.080610
+
+[10 rows x 5 columns]
+
+--- Top 5 Lowest Confidence Rows ---
+           date     price  ...  sell_action current_return
+609  2025-07-17  23113.28  ...         SELL       1.252077
+651  2025-09-15  25357.16  ...         HOLD       1.084421
+707  2025-12-08  28303.78  ...         HOLD       1.036696
+280  2024-03-11  19726.08  ...         SELL       1.058007
+296  2024-04-02  20466.57  ...         HOLD       1.016897
+
+[5 rows x 5 columns]

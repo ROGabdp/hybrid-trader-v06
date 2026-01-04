@@ -459,7 +459,8 @@ def calculate_regime_status(df: pd.DataFrame, lookback: int = 3) -> dict:
     }
 
 
-def v5_inference(workspace: dict, df: pd.DataFrame, open_positions: list = None, current_price: float = None) -> dict:
+def v5_inference(workspace: dict, df: pd.DataFrame, open_positions: list = None, current_price: float = None,
+                 sell_threshold: float = 0.5, buy_consensus_threshold: float = 0.8) -> dict:
     """
     V5 策略推論 (動態濾網)
     
@@ -468,9 +469,12 @@ def v5_inference(workspace: dict, df: pd.DataFrame, open_positions: list = None,
         df: 特徵 DataFrame
         open_positions: 從回測讀取的 AI 持倉清單 (含 buy_price, buy_date)
         current_price: 盤中即時價 (用於計算各持倉報酬率)
+        sell_threshold: 賣出信心門檻 (預設 0.5)
+        buy_consensus_threshold: 買入共識門檻 (預設 0.8)
     """
     print("\n" + "=" * 60)
     print("🎯 Step 3: V5 策略推論 (動態濾網)")
+    print(f"   ⚙️ Consensus: Sell Threshold > {sell_threshold} | Buy Veto > {buy_consensus_threshold}")
     print("=" * 60)
     
     from stable_baselines3 import PPO
@@ -563,7 +567,28 @@ def v5_inference(workspace: dict, df: pd.DataFrame, open_positions: list = None,
                     sell_conf = float(s_prob[1]) if s_act[0] == 1 else float(s_prob[0])
                     
                     # 判斷是否觸發停損 (硬性規則: -8%)
+                    sell_action = 'SELL' if s_act[0] == 1 else 'HOLD'
+                    sell_conf = float(s_prob[1]) if s_act[0] == 1 else float(s_prob[0])
+                    
+                    # 判斷是否觸發停損 (硬性規則: -8%)
                     triggered_stop_loss = current_return < 0.92
+
+                    # 🔥 Agent Consensus Logic
+                    is_sell_signal = (s_act[0] == 1 and sell_conf > sell_threshold)
+                    is_consensus_hold = False
+                    veto_reason = ""
+                    
+                    if is_sell_signal and not triggered_stop_loss:
+                        if buy_prob > buy_consensus_threshold:
+                            is_consensus_hold = True
+                            veto_reason = f"🚫 Consensus Veto (Buy Conf {buy_prob:.1%} > {buy_consensus_threshold})"
+                            print(f"    -> Sell Signal Vetoed! {veto_reason}")
+
+                    final_action = 'HOLD'
+                    if triggered_stop_loss:
+                        final_action = 'SELL'
+                    elif is_sell_signal and not is_consensus_hold:
+                        final_action = 'SELL'
                     
                     position_decisions.append({
                         'buy_date': buy_date,
@@ -573,7 +598,9 @@ def v5_inference(workspace: dict, df: pd.DataFrame, open_positions: list = None,
                         'action': sell_action,
                         'confidence': sell_conf,
                         'triggered_stop_loss': triggered_stop_loss,
-                        'final_action': 'SELL' if triggered_stop_loss else sell_action
+                        'is_consensus_hold': is_consensus_hold,
+                        'veto_reason': veto_reason,
+                        'final_action': final_action
                     })
         else:
             print(f"  [V5] 無 AI 持倉，跳過 Sell Agent 分析")
@@ -763,12 +790,16 @@ def generate_intraday_report(workspace: dict, df: pd.DataFrame, res: dict, date_
                 triggered_stop_loss = pd.get('triggered_stop_loss', False)
                 
                 # 決定顯示格式
+                # 決定顯示格式
                 if triggered_stop_loss:
                     status_icon = "🔴 SELL"
                     reason = f"停損觸發 (AI: {action} {confidence:.1%})"
                 elif final_action == 'SELL':
                     status_icon = "🔴 SELL"
                     reason = f"AI決定 ({confidence:.1%})"
+                elif pd.get('is_consensus_hold', False):
+                    status_icon = "🟢 HOLD"
+                    reason = f"AI賣訊被否決 ({pd.get('veto_reason')})"
                 else:
                     status_icon = "🟢 HOLD"
                     reason = f"AI決定 ({confidence:.1%})"
@@ -849,6 +880,8 @@ def main():
         default=None,
         help='回測起始日期 (YYYY-MM-DD 或 YYYYMMDD 格式)'
     )
+    parser.add_argument('--sell-threshold', type=float, default=0.5, help='Confidence threshold for sell signals')
+    parser.add_argument('--buy-consensus-threshold', type=float, default=0.8, help='Buy confidence threshold to veto sell signals')
     args = parser.parse_args()
     
     now = datetime.now()
@@ -876,10 +909,16 @@ def main():
     # Step 2: 特徵工程
     df = feature_engineering(intraday_data, avg_volume)
     
-    # Step 3 (傳入真實持倉資訊)
+    # Step 3: V5 策略推論 (傳入真實持倉資訊)
     open_positions = backtest_status.get('open_positions', []) if backtest_status else []
     current_price = float(intraday_data[4])  # intraday_data = (date, o, h, l, c)
-    res = v5_inference(ws, df, open_positions=open_positions, current_price=current_price)
+    res = v5_inference(
+        ws, df, 
+        open_positions=open_positions, 
+        current_price=current_price,
+        sell_threshold=args.sell_threshold,
+        buy_consensus_threshold=args.buy_consensus_threshold
+    )
     
     # Step 4
     generate_intraday_report(ws, df, res, intraday_data[0], intraday_data, avg_volume, backtest_status)

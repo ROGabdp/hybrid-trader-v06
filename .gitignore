@@ -58,3 +58,4 @@ Thumbs.db
 models_hybrid_v5
 data
 01 去除LSTM，並修復sell agent不會賣的問題
+02 引入代理人共識機制，避免左手買右手賣

@@ -46,9 +46,9 @@ SPLIT_DATE = '2023-01-01'
 
 # V5: 訓練步數設定
 PRETRAIN_BUY_STEPS = 1_000_000
-PRETRAIN_SELL_STEPS = 500_000
+PRETRAIN_SELL_STEPS = 1_000_000  # [User Request] Increase to 1M
 FINETUNE_BUY_STEPS = 1_000_000
-FINETUNE_SELL_STEPS = 500_000
+FINETUNE_SELL_STEPS = 1_000_000  # [User Request] Increase to 1M
 
 
 def clear_cache():
@@ -225,10 +225,15 @@ def run_finetuning_v5(train_buy=True, train_sell=True):
     
     import ptrl_hybrid_system as hybrid
     import torch
+    from datetime import datetime
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, CallbackList
     from stable_baselines3.common.env_util import make_vec_env
     from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+    from stable_baselines3.common.env_util import make_vec_env
+    from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+    from stable_baselines3.common.logger import configure
+    from stable_baselines3.common.utils import get_schedule_fn
     
     # [v6.0] 強制使用 CPU (小型 MLP + 多環境 PPO 在 CPU 更快)
     device = "cpu"
@@ -268,10 +273,10 @@ def run_finetuning_v5(train_buy=True, train_sell=True):
     n_envs = min(4, max(1, multiprocessing.cpu_count() - 1))
     
     finetune_params = {
-        "learning_rate": 1e-5,
+        "learning_rate": 5e-6,  # [Fix] Reduce from 1e-5 for stable fine-tune
         "n_steps": 256,
         "batch_size": 128,
-        "ent_coef": 0.005,
+        "ent_coef": 0.01,  # [Fix] Increase from 0.005 to prevent premature convergence
         "device": device,
         "verbose": 1
     }
@@ -294,20 +299,26 @@ def run_finetuning_v5(train_buy=True, train_sell=True):
         eval_buy_env = make_vec_env(hybrid.BuyEnvHybridV5, n_envs=1, vec_env_cls=DummyVecEnv,
                                     env_kwargs={'data_dict': eval_data, 'is_training': False})
         
-        buy_model = PPO.load(buy_base_path, env=buy_env, device=device,
-                             tensorboard_log=tensorboard_log)
+        buy_model = PPO.load(buy_base_path, env=buy_env, device=device)
+        # 建立獨立的 TensorBoard Logger (每次訓練開新資料夾)
+        buy_log_name = f"buy_v5_finetune_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        buy_logger = configure(os.path.join(tensorboard_log, buy_log_name), ["tensorboard", "stdout"])
+        buy_model.set_logger(buy_logger)
+        buy_logger = configure(os.path.join(tensorboard_log, buy_log_name), ["tensorboard", "stdout"])
+        buy_model.set_logger(buy_logger)
         buy_model.learning_rate = finetune_params["learning_rate"]
+        buy_model.lr_schedule = get_schedule_fn(buy_model.learning_rate)  # [Fix] Update schedule
         buy_model.ent_coef = finetune_params["ent_coef"]
         
         buy_callbacks = CallbackList([
             CheckpointCallback(save_freq=100000, save_path=V5_MODELS_PATH, name_prefix="ppo_buy_finetune"),
             EvalCallback(eval_buy_env, best_model_save_path=os.path.join(V5_MODELS_PATH, "best_tuned", "buy"),
-                         log_path="./logs/", eval_freq=10000, n_eval_episodes=30, deterministic=True)
+                         log_path="./logs/", eval_freq=10000, n_eval_episodes=100, deterministic=True)  # [Fix] 30->100
         ])
         
-        print(f"[Fine-tune] Training Buy Agent V5 for {FINETUNE_BUY_STEPS:,} steps")
+        print(f"[Fine-tune] Training Buy Agent V5 for {FINETUNE_BUY_STEPS:,} steps (log: {buy_log_name})")
         buy_model.learn(total_timesteps=FINETUNE_BUY_STEPS, callback=buy_callbacks,
-                        tb_log_name="buy_v5_finetune", reset_num_timesteps=False)
+                        reset_num_timesteps=False)
         
         best_buy_path = os.path.join(V5_MODELS_PATH, "best_tuned", "buy", "best_model.zip")
         buy_final_path = os.path.join(V5_MODELS_PATH, "ppo_buy_twii_final.zip")
@@ -336,20 +347,26 @@ def run_finetuning_v5(train_buy=True, train_sell=True):
         eval_sell_env = make_vec_env(hybrid.SellEnvHybrid, n_envs=1, vec_env_cls=DummyVecEnv,
                                      env_kwargs={'data_dict': eval_data})
         
-        sell_model = PPO.load(sell_base_path, env=sell_env, device=device,
-                              tensorboard_log=tensorboard_log)
+        sell_model = PPO.load(sell_base_path, env=sell_env, device=device)
+        # 建立獨立的 TensorBoard Logger (每次訓練開新資料夾)
+        sell_log_name = f"sell_v5_finetune_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        sell_logger = configure(os.path.join(tensorboard_log, sell_log_name), ["tensorboard", "stdout"])
+        sell_model.set_logger(sell_logger)
+        sell_logger = configure(os.path.join(tensorboard_log, sell_log_name), ["tensorboard", "stdout"])
+        sell_model.set_logger(sell_logger)
         sell_model.learning_rate = finetune_params["learning_rate"]
+        sell_model.lr_schedule = get_schedule_fn(sell_model.learning_rate)  # [Fix] Update schedule
         sell_model.ent_coef = finetune_params["ent_coef"]
         
         sell_callbacks = CallbackList([
             CheckpointCallback(save_freq=50000, save_path=V5_MODELS_PATH, name_prefix="ppo_sell_finetune"),
             EvalCallback(eval_sell_env, best_model_save_path=os.path.join(V5_MODELS_PATH, "best_tuned", "sell"),
-                         log_path="./logs/", eval_freq=10000, n_eval_episodes=30, deterministic=True)
+                         log_path="./logs/", eval_freq=10000, n_eval_episodes=100, deterministic=True)  # [Fix] 30->100
         ])
         
-        print(f"[Fine-tune] Training Sell Agent for {FINETUNE_SELL_STEPS:,} steps")
+        print(f"[Fine-tune] Training Sell Agent for {FINETUNE_SELL_STEPS:,} steps (log: {sell_log_name})")
         sell_model.learn(total_timesteps=FINETUNE_SELL_STEPS, callback=sell_callbacks,
-                         tb_log_name="sell_v5_finetune", reset_num_timesteps=False)
+                         reset_num_timesteps=False)
         
         best_sell_path = os.path.join(V5_MODELS_PATH, "best_tuned", "sell", "best_model.zip")
         sell_final_path = os.path.join(V5_MODELS_PATH, "ppo_sell_twii_final.zip")

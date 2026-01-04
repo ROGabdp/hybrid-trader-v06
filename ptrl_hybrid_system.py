@@ -624,7 +624,20 @@ class BuyEnvHybridV5(gym.Env):
         return self.current_sample[0], reward, True, False, {}
 
 class SellEnvHybrid(gym.Env):
-    """Sell RL Environment"""
+    """Sell RL Environment (v6.0 - Fixed Reward Hacking)
+    
+    修正重點:
+    1. 隨機化 Episode 長度 (60~250 天)，避免 Agent 學會「死守到第 N 天」
+    2. 解耦獎勵視窗：無論何時結算，都往後看固定 60 天來計算錯失獎勵
+    3. 資料切片擴大到 310 天，確保有足夠的未來數據供獎勵計算
+    """
+    
+    # Episode / Reward 參數
+    MIN_EPISODE_LENGTH = 60
+    MAX_EPISODE_LENGTH = 250
+    REWARD_LOOKAHEAD = 60  # 結算時往後偷看的天數
+    DATA_BUFFER = MAX_EPISODE_LENGTH + REWARD_LOOKAHEAD  # 310 天
+    
     def __init__(self, data_dict):
         super().__init__()
         self.episodes = []
@@ -635,29 +648,42 @@ class SellEnvHybrid(gym.Env):
             close_prices = df['Close'].values.astype(np.float32)
             
             for idx in buy_indices:
-                if idx + 120 < len(df):
-                    episode_prices = close_prices[idx:idx+120]
+                # 確保有足夠的數據供 Episode + Lookahead
+                if idx + self.DATA_BUFFER < len(df):
+                    episode_prices = close_prices[idx:idx + self.DATA_BUFFER]
                     self.episodes.append({
-                        'features': feature_data[idx:idx+120],
+                        'features': feature_data[idx:idx + self.DATA_BUFFER],
                         'returns': episode_prices / episode_prices[0]
                     })
         
         self.action_space = spaces.Discrete(2)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(len(FEATURE_COLS) + 1,), dtype=np.float32)
+        
+        # 會在 reset 時隨機決定
+        self.max_steps = self.MAX_EPISODE_LENGTH
+        self.current_episode = None
+        self.day = 0
     
     def reset(self, seed=None, options=None):
         self.current_episode = self.episodes[np.random.randint(len(self.episodes))]
         self.day = 0
+        # 🔀 隨機化本回合的最大步數
+        self.max_steps = np.random.randint(self.MIN_EPISODE_LENGTH, self.MAX_EPISODE_LENGTH + 1)
         return np.concatenate([self.current_episode['features'][0], [1.0]]).astype(np.float32), {}
     
     def step(self, action):
         current_return = self.current_episode['returns'][self.day]
         
-        if action == 1 or self.day >= 119:  # 賣出 或 第120天強制結算
-            # 計算未來的最高點和最低點
-            future_returns = self.current_episode['returns'][self.day:]
-            future_max = np.max(future_returns)
-            future_min = np.min(future_returns)
+        # 強制結算條件：Agent 選擇賣出 OR 達到本回合隨機上限
+        if action == 1 or self.day >= self.max_steps - 1:
+            # =========================================================
+            # 🔧 解耦獎勵計算：無論何時結算，都往後看固定 REWARD_LOOKAHEAD 天
+            # =========================================================
+            lookahead_end = min(self.day + self.REWARD_LOOKAHEAD, self.DATA_BUFFER)
+            future_returns = self.current_episode['returns'][self.day:lookahead_end]
+            
+            future_max = np.max(future_returns) if len(future_returns) > 0 else current_return
+            future_min = np.min(future_returns) if len(future_returns) > 0 else current_return
             
             # 1. 基礎獎勵：當前報酬 (獲利 10% = +1.0, 虧 5% = -0.5)
             base_reward = (current_return - 1.0) * 10
@@ -689,9 +715,12 @@ class SellEnvHybrid(gym.Env):
             self.day += 1
             done = False
         
-        obs = np.concatenate([self.current_episode['features'][min(self.day, 119)], 
-                              [self.current_episode['returns'][min(self.day, 119)]]]).astype(np.float32)
+        # 安全索引：確保不超過 max_steps (觀測用)，但獎勵計算可用 DATA_BUFFER
+        obs_idx = min(self.day, self.max_steps - 1)
+        obs = np.concatenate([self.current_episode['features'][obs_idx], 
+                              [self.current_episode['returns'][obs_idx]]]).astype(np.float32)
         return obs, reward, done, False, {}
+
 
 
 # =============================================================================
